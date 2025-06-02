@@ -287,32 +287,52 @@ class DilatedConvDecoder(nn.OutputSplitsLayer):
   
   
 @gin.register
-class TransformerDecoderLayer(tf.keras.layers.Layer):
-    def __init__(self, d_model, num_heads, ff_dim, dropout=0.1):
-        super().__init__()
+class TransformerDecoderLayer(nn.DictLayer):
+    def __init__(self,
+                 d_model=256,
+                 num_heads=4,
+                 ff_dim=512,
+                 dropout=0.1,
+                 input_keys=('decoder_input', 'voice_embedding'),
+                 output_keys=('decoder_output',),
+                 **kwargs):
+        super().__init__(input_keys=input_keys,
+                         output_keys=output_keys,
+                         **kwargs)
+
         self.self_attn = tfkl.MultiHeadAttention(num_heads, key_dim=d_model)
         self.cross_attn = tfkl.MultiHeadAttention(num_heads, key_dim=d_model)
+
         self.ffn = tf.keras.Sequential([
             tfkl.Dense(ff_dim, activation='relu'),
             tfkl.Dense(d_model),
         ])
+
         self.norm1 = tfkl.LayerNormalization()
         self.norm2 = tfkl.LayerNormalization()
         self.norm3 = tfkl.LayerNormalization()
         self.dropout = tfkl.Dropout(dropout)
 
-    def call(self, x, context):
+    def call(self, decoder_input, voice_embedding):
+        """
+        decoder_input: Tensor [B, T, D]
+        voice_embedding: Tensor [B, T', D] or broadcasted [B, T, D]
+        Returns:
+            Dict with 'decoder_output': Tensor [B, T, D]
+        """
         # Self-attention
-        attn1 = self.self_attn(x, x)
-        x = self.norm1(x + self.dropout(attn1))
+        attn1 = self.self_attn(decoder_input, decoder_input)
+        x = self.norm1(decoder_input + self.dropout(attn1))
 
         # Cross-attention
-        attn2 = self.cross_attn(x, context)
+        attn2 = self.cross_attn(x, voice_embedding)
         x = self.norm2(x + self.dropout(attn2))
 
         # Feed-forward
         ff = self.ffn(x)
         x = self.norm3(x + self.dropout(ff))
-        return x
+
+        return {'decoder_output': x}
+
 
 
