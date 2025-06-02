@@ -283,5 +283,36 @@ class DilatedConvDecoder(nn.OutputSplitsLayer):
   def compute_output(self, *inputs):
     stack_inputs = self._parse_inputs(inputs)
     return self.dilated_conv_stack(stack_inputs)
+  
+  
+  
+@gin.register
+class TransformerDecoderLayer(tf.keras.layers.Layer):
+    def __init__(self, d_model, num_heads, ff_dim, dropout=0.1):
+        super().__init__()
+        self.self_attn = tfkl.MultiHeadAttention(num_heads, key_dim=d_model)
+        self.cross_attn = tfkl.MultiHeadAttention(num_heads, key_dim=d_model)
+        self.ffn = tf.keras.Sequential([
+            tfkl.Dense(ff_dim, activation='relu'),
+            tfkl.Dense(d_model),
+        ])
+        self.norm1 = tfkl.LayerNormalization()
+        self.norm2 = tfkl.LayerNormalization()
+        self.norm3 = tfkl.LayerNormalization()
+        self.dropout = tfkl.Dropout(dropout)
+
+    def call(self, x, context):
+        # Self-attention
+        attn1 = self.self_attn(x, x)
+        x = self.norm1(x + self.dropout(attn1))
+
+        # Cross-attention
+        attn2 = self.cross_attn(x, context)
+        x = self.norm2(x + self.dropout(attn2))
+
+        # Feed-forward
+        ff = self.ffn(x)
+        x = self.norm3(x + self.dropout(ff))
+        return x
 
 
