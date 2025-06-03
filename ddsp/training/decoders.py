@@ -285,7 +285,27 @@ class DilatedConvDecoder(nn.OutputSplitsLayer):
     return self.dilated_conv_stack(stack_inputs)
   
   
-  
+class PositionalEncoding(tfkl.Layer):
+    def __init__(self, d_model, max_len=1000):
+        super().__init__()
+        pos = tf.range(max_len, dtype=tf.float32)[:, tf.newaxis]
+        i = tf.range(d_model, dtype=tf.float32)[tf.newaxis, :]
+        angle_rates = 1 / tf.pow(10000.0, (2 * (i // 2)) / tf.cast(d_model, tf.float32))
+        angle_rads = pos * angle_rates
+
+        # apply sin to even indices in the array; 2i
+        sines = tf.sin(angle_rads[:, 0::2])
+
+        # apply cos to odd indices in the array; 2i+1
+        cosines = tf.cos(angle_rads[:, 1::2])
+
+        self.pos_encoding = tf.concat([sines, cosines], axis=-1)[tf.newaxis, ...]
+
+    def call(self, x):
+        seq_len = tf.shape(x)[1]
+        return x + self.pos_encoding[:, :seq_len, :]
+      
+      
 @gin.register
 class TransformerDecoderLayer(nn.DictLayer):
     def __init__(self,
@@ -293,15 +313,25 @@ class TransformerDecoderLayer(nn.DictLayer):
                  num_heads=4,
                  ff_dim=512,
                  dropout=0.1,
-                 input_keys=('decoder_input', 'voice_embedding'),
-                 output_keys=('decoder_output',),
+                 key_dim=64,
+                 project_output=True,
+                 output_splits=(('amps', 1), ('harmonic_distribution', 40)),
                  **kwargs):
-        super().__init__(input_keys=input_keys,
+
+        self.output_splits = output_splits
+        self.d_model = d_model
+        self.project_output = project_output
+
+        output_keys = [k for k, _ in output_splits] if project_output else ['decoder_output']
+        super().__init__(input_keys=['x', 'voice_embedding'],
                          output_keys=output_keys,
                          **kwargs)
 
-        self.self_attn = tfkl.MultiHeadAttention(num_heads, key_dim=d_model)
-        self.cross_attn = tfkl.MultiHeadAttention(num_heads, key_dim=d_model)
+        self.input_proj = tfkl.Dense(d_model)
+        self.positional_encoding = PositionalEncoding(d_model)
+
+        self.self_attn = tfkl.MultiHeadAttention(num_heads=num_heads, key_dim=key_dim)
+        self.cross_attn = tfkl.MultiHeadAttention(num_heads=num_heads, key_dim=key_dim)
 
         self.ffn = tf.keras.Sequential([
             tfkl.Dense(ff_dim, activation='relu'),
@@ -313,26 +343,82 @@ class TransformerDecoderLayer(nn.DictLayer):
         self.norm3 = tfkl.LayerNormalization()
         self.dropout = tfkl.Dropout(dropout)
 
-    def call(self, decoder_input, voice_embedding):
-        """
-        decoder_input: Tensor [B, T, D]
-        voice_embedding: Tensor [B, T', D] or broadcasted [B, T, D]
-        Returns:
-            Dict with 'decoder_output': Tensor [B, T, D]
-        """
-        # Self-attention
-        attn1 = self.self_attn(decoder_input, decoder_input)
-        x = self.norm1(decoder_input + self.dropout(attn1))
+        if self.project_output:
+            n_out = sum([v[1] for v in output_splits])
+            self.out_proj = tfkl.Dense(n_out)
 
-        # Cross-attention
-        attn2 = self.cross_attn(x, voice_embedding)
-        x = self.norm2(x + self.dropout(attn2))
+    def call(self, x, voice_embedding):
+        x = self.input_proj(x)
+        x = self.positional_encoding(x)
 
-        # Feed-forward
-        ff = self.ffn(x)
-        x = self.norm3(x + self.dropout(ff))
+        if len(voice_embedding.shape) == 2:
+            voice_embedding = tf.expand_dims(voice_embedding, 1)
+            voice_embedding = tf.tile(voice_embedding, [1, tf.shape(x)[1], 1])
 
-        return {'decoder_output': x}
+        x = self.norm1(x + self.dropout(self.self_attn(x, x)))
+        x = self.norm2(x + self.dropout(self.cross_attn(x, voice_embedding)))
+        x = self.norm3(x + self.dropout(self.ffn(x)))
+
+        if self.project_output:
+            x_out = self.out_proj(x)
+            return nn.split_to_dict(x_out, self.output_splits)
+        else:
+            return {'decoder_output': x}
 
 
+
+@gin.register
+class TransformerDecoder(nn.DictLayer):
+    def __init__(self,
+                 num_layers=4,
+                 d_model=256,
+                 num_heads=4,
+                 ff_dim=512,
+                 dropout=0.1,
+                 key_dim=64,
+                 input_keys=('ld_scaled', 'f0_scaled', 'z', 'voice_embedding'),
+                 output_splits=(('amps', 1), ('harmonic_distribution', 40)),
+                 **kwargs):
+
+        self.output_splits = output_splits
+        self.d_model = d_model
+        self.num_layers = num_layers
+
+        output_keys = [k for k, _ in output_splits]
+        super().__init__(input_keys=input_keys,
+                         output_keys=output_keys,
+                         **kwargs)
+
+        # Layer-Stack
+        self.layers = [
+            TransformerDecoderLayer(
+                d_model=d_model,
+                num_heads=num_heads,
+                ff_dim=ff_dim,
+                dropout=dropout,
+                key_dim=key_dim,
+                project_output=False,
+                output_splits=output_splits,
+            )
+            for _ in range(num_layers - 1)
+        ]
+
+        self.final_layer = TransformerDecoderLayer(
+            d_model=d_model,
+            num_heads=num_heads,
+            ff_dim=ff_dim,
+            dropout=dropout,
+            key_dim=key_dim,
+            project_output=True,
+            output_splits=output_splits,
+        )
+
+    def call(self, ld_scaled, f0_scaled, z, voice_embedding):
+        # Initial input fusion
+        x = tf.concat([ld_scaled, f0_scaled, z], axis=-1)
+
+        for layer in self.layers:
+            x = layer(x=x, voice_embedding=voice_embedding)['decoder_output']
+
+        return self.final_layer(x=x, voice_embedding=voice_embedding)
 
